@@ -33,6 +33,9 @@ from langchain_core.runnables import (
     RunnableSequence,
 )
 from langchain_core.tools import BaseTool
+from pydantic import BaseModel
+from typing_extensions import Annotated, NotRequired, TypedDict
+
 from langgraph._internal._runnable import RunnableCallable, RunnableLike
 from langgraph._internal._typing import MISSING
 from langgraph.errors import ErrorCode, create_error_message
@@ -40,15 +43,12 @@ from langgraph.graph import END, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.managed import RemainingSteps
+from langgraph.prebuilt.tool_node import ToolNode
 from langgraph.runtime import Runtime
 from langgraph.store.base import BaseStore
 from langgraph.types import Checkpointer, Send
 from langgraph.typing import ContextT
 from langgraph.warnings import LangGraphDeprecatedSinceV10
-from pydantic import BaseModel
-from typing_extensions import Annotated, NotRequired, TypedDict
-
-from langgraph.prebuilt.tool_node import ToolNode
 
 StructuredResponse = Union[dict, BaseModel]
 StructuredResponseSchema = Union[dict, type[BaseModel]]
@@ -276,6 +276,7 @@ def create_react_agent(
     debug: bool = False,
     version: Literal["v1", "v2"] = "v2",
     name: Optional[str] = None,
+    node_name: Optional[str] = "agent",
     **deprecated_kwargs: Any,
 ) -> CompiledStateGraph:
     """Creates an agent graph that calls tools in a loop until a stopping condition is met.
@@ -390,24 +391,16 @@ def create_react_agent(
         state_schema: An optional state schema that defines graph state.
             Must have `messages` and `remaining_steps` keys.
             Defaults to `AgentState` that defines those two keys.
-            !!! Note
-                `remaining_steps` is used to limit the number of steps the react agent can take.
-                Calculated roughly as `recursion_limit` - `total_steps_taken`.
-                If `remaining_steps` is less than 2 and tool calls are present in the response,
-                the react agent will return a final AI Message with
-                the content "Sorry, need more steps to process this request.".
-                No `GraphRecusionError` will be raised in this case.
-
         context_schema: An optional schema for runtime context.
         checkpointer: An optional checkpoint saver object. This is used for persisting
             the state of the graph (e.g., as chat memory) for a single thread (e.g., a single conversation).
         store: An optional store object. This is used for persisting data
             across multiple threads (e.g., multiple conversations / users).
         interrupt_before: An optional list of node names to interrupt before.
-            Should be one of the following: "agent", "tools".
+            Should be one of the following: node_name, "tools".
             This is useful if you want to add a user confirmation or other interrupt before taking an action.
         interrupt_after: An optional list of node names to interrupt after.
-            Should be one of the following: "agent", "tools".
+            Should be one of the following: node_name, "tools".
             This is useful if you want to return directly or run additional processing on an output.
         debug: A flag indicating whether to enable debug mode.
         version: Determines the version of the graph to create.
@@ -431,7 +424,7 @@ def create_react_agent(
     Returns:
         A compiled LangChain runnable that can be used for chat interactions.
 
-    The "agent" node calls the language model with the messages list (after applying the prompt).
+    The node_name node calls the language model with the messages list (after applying the prompt).
     If the resulting AIMessage contains `tool_calls`, the graph will then call the ["tools"][langgraph.prebuilt.tool_node.ToolNode].
     The "tools" node executes the tools (1 tool per `tool_call`) and adds the responses to the messages list
     as `ToolMessage` objects. The agent node then calls the language model again.
@@ -744,22 +737,22 @@ def create_react_agent(
         # Define a new graph
         workflow = StateGraph(state_schema=state_schema, context_schema=context_schema)
         workflow.add_node(
-            "agent",
+            node_name,
             RunnableCallable(call_model, acall_model),
             input_schema=input_schema,
         )
         if pre_model_hook is not None:
             workflow.add_node("pre_model_hook", pre_model_hook)  # type: ignore[arg-type]
-            workflow.add_edge("pre_model_hook", "agent")
+            workflow.add_edge("pre_model_hook", node_name)
             entrypoint = "pre_model_hook"
         else:
-            entrypoint = "agent"
+            entrypoint = node_name
 
         workflow.set_entry_point(entrypoint)
 
         if post_model_hook is not None:
             workflow.add_node("post_model_hook", post_model_hook)  # type: ignore[arg-type]
-            workflow.add_edge("agent", "post_model_hook")
+            workflow.add_edge(node_name, "post_model_hook")
 
         if response_format is not None:
             workflow.add_node(
@@ -772,7 +765,7 @@ def create_react_agent(
             if post_model_hook is not None:
                 workflow.add_edge("post_model_hook", "generate_structured_response")
             else:
-                workflow.add_edge("agent", "generate_structured_response")
+                workflow.add_edge(node_name, "generate_structured_response")
 
         return workflow.compile(
             checkpointer=checkpointer,
@@ -815,20 +808,20 @@ def create_react_agent(
 
     # Define the two nodes we will cycle between
     workflow.add_node(
-        "agent",
+        node_name,
         RunnableCallable(call_model, acall_model),
         input_schema=input_schema,
     )
     workflow.add_node("tools", tool_node)
 
     # Optionally add a pre-model hook node that will be called
-    # every time before the "agent" (LLM-calling node)
+    # every time before the node_name (LLM-calling node)
     if pre_model_hook is not None:
         workflow.add_node("pre_model_hook", pre_model_hook)  # type: ignore[arg-type]
-        workflow.add_edge("pre_model_hook", "agent")
+        workflow.add_edge("pre_model_hook", node_name)
         entrypoint = "pre_model_hook"
     else:
-        entrypoint = "agent"
+        entrypoint = node_name
 
     # Set the entrypoint as `agent`
     # This means that this node is the first one called
@@ -841,7 +834,7 @@ def create_react_agent(
     if post_model_hook is not None:
         workflow.add_node("post_model_hook", post_model_hook)  # type: ignore[arg-type]
         agent_paths.append("post_model_hook")
-        workflow.add_edge("agent", "post_model_hook")
+        workflow.add_edge(node_name, "post_model_hook")
     else:
         agent_paths.append("tools")
 
@@ -906,7 +899,7 @@ def create_react_agent(
         )
 
     workflow.add_conditional_edges(
-        "agent",
+        node_name,
         should_continue,
         path_map=agent_paths,
     )
